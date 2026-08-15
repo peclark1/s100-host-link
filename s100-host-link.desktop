@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=S-100 Host Link
+Comment=Transfer files to the S-100 Z80 SBC over its onboard USB interface
+Exec=python3 s100_hostlink_gtk4.py
+Terminal=false
+Categories=Utility;
