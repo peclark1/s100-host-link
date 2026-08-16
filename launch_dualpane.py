@@ -197,4 +197,5 @@ ui.HostLinkV2.CMD_GET = 3
 ui.HostLinkV2.receive_file = _receive_file_safe
 
 if __name__ == "__main__":
-    ui.main()
+    ui.Adw.init()
+    raise SystemExit(ui.App().run(None))
