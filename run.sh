@@ -1,2 +1,2 @@
 #!/bin/sh
-exec python3 "$(dirname "$0")/launch_dualpane.py" "$@"
+exec python3 "$(dirname "$0")/launch_resizable.py" "$@"
