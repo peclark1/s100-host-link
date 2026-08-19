@@ -9,16 +9,19 @@ and layers UI refinements over the development dual-pane window:
 * automatic, debounced CP/M directory refresh after drive/user changes
 * manual refresh buttons for the Linux directory and serial-port list
 * drag-and-drop-only file transfer controls; Send/Receive buttons are hidden
+* startup settings restore without overwriting the saved baud rate
 """
 from __future__ import annotations
 
 import launch_dualpane as base
 
+Adw = base.ui.Adw
 Gtk = base.ui.Gtk
 GLib = base.ui.GLib
 
 _ORIGINAL_INIT = base.ui.Win.__init__
 _ORIGINAL_TARGET = base.ui.Win.target
+_ORIGINAL_SAVE = base.ui.Win.save
 
 
 def _children(widget):
@@ -26,6 +29,16 @@ def _children(widget):
     while child is not None:
         yield child
         child = child.get_next_sibling()
+
+
+def _find_ancestor(widget, widget_type):
+    """Return the first parent/ancestor matching widget_type."""
+    parent = widget.get_parent()
+    while parent is not None:
+        if isinstance(parent, widget_type):
+            return parent
+        parent = parent.get_parent()
+    return None
 
 
 def _find_two_frame_box(widget):
@@ -82,6 +95,13 @@ def _cpm_selected(self, _listbox, row):
     self.buttons()
 
 
+def _save_settings(self, *args):
+    """Avoid clobbering saved settings while startup widgets are initialized."""
+    if getattr(self, "_suppress_settings_save", False):
+        return
+    return _ORIGINAL_SAVE(self, *args)
+
+
 def _target_changed(self, *args):
     """Save drive/user and automatically refresh the selected CP/M directory."""
     _ORIGINAL_TARGET(self, *args)
@@ -110,13 +130,18 @@ def _target_changed(self, *args):
 
 def _install_usability_controls(self):
     """Add manual refresh controls and make drag-and-drop the transfer UI."""
-    port_row = self.pdd.get_parent()
-    if port_row is not None and hasattr(port_row, "add_suffix"):
+    # Adw.ActionRow inserts suffix widgets into an internal container, so the
+    # dropdown's immediate GTK parent is not the ActionRow itself. Walk upward
+    # to find the owning row, then add the serial refresh button beside it.
+    port_row = _find_ancestor(self.pdd, Adw.ActionRow)
+    if port_row is not None:
         self.port_refresh_button = Gtk.Button.new_from_icon_name("view-refresh-symbolic")
         self.port_refresh_button.set_tooltip_text("Refresh serial ports")
         self.port_refresh_button.set_valign(Gtk.Align.CENTER)
         self.port_refresh_button.connect("clicked", lambda _button: self.refresh_ports())
         port_row.add_suffix(self.port_refresh_button)
+    else:
+        self.log("WARNING: Could not locate USB-device row for serial refresh button.")
 
     linux_toolbar = self.path.get_parent()
     if isinstance(linux_toolbar, Gtk.Box):
@@ -136,11 +161,16 @@ def _install_usability_controls(self):
 
 
 def _resizable_init(self, app):
-    # Suppress target auto-refresh while the saved drive/user values are being
-    # restored by the original constructor.
+    # The base constructor does ui() -> refresh_ports() -> restore(). Selecting
+    # a serial port during refresh_ports() emits notify::selected and calls
+    # save(), while the baud widget is still at its default 9600. Suppress all
+    # settings writes until restore() has finished so a saved 115200 (or any
+    # other baud) is not overwritten during startup.
+    self._suppress_settings_save = True
     self._suppress_target_refresh = True
     self._target_refresh_source = 0
     _ORIGINAL_INIT(self, app)
+    self._suppress_settings_save = False
     self._suppress_target_refresh = False
 
     _install_usability_controls(self)
@@ -187,6 +217,7 @@ def _resizable_init(self, app):
 base.ui.Win.lselected = _linux_selected
 base.ui.Win.lactivate = _linux_activated
 base.ui.Win.cselected = _cpm_selected
+base.ui.Win.save = _save_settings
 base.ui.Win.target = _target_changed
 base.ui.Win.__init__ = _resizable_init
 
