@@ -7,6 +7,8 @@ and layers UI refinements over the development dual-pane window:
 * native draggable Gtk.Paned divider
 * reliable Linux/CP/M row selection using ListBox row indexes
 * automatic, debounced CP/M directory refresh after drive/user changes
+* manual refresh buttons for the Linux directory and serial-port list
+* drag-and-drop-only file transfer controls; Send/Receive buttons are hidden
 """
 from __future__ import annotations
 
@@ -106,6 +108,33 @@ def _target_changed(self, *args):
     self._target_refresh_source = GLib.timeout_add(250, refresh_selected_target)
 
 
+def _install_usability_controls(self):
+    """Add manual refresh controls and make drag-and-drop the transfer UI."""
+    port_row = self.pdd.get_parent()
+    if port_row is not None and hasattr(port_row, "add_suffix"):
+        self.port_refresh_button = Gtk.Button.new_from_icon_name("view-refresh-symbolic")
+        self.port_refresh_button.set_tooltip_text("Refresh serial ports")
+        self.port_refresh_button.set_valign(Gtk.Align.CENTER)
+        self.port_refresh_button.connect("clicked", lambda _button: self.refresh_ports())
+        port_row.add_suffix(self.port_refresh_button)
+
+    linux_toolbar = self.path.get_parent()
+    if isinstance(linux_toolbar, Gtk.Box):
+        self.linux_refresh_button = Gtk.Button.new_from_icon_name("view-refresh-symbolic")
+        self.linux_refresh_button.set_tooltip_text("Refresh Linux file list")
+        self.linux_refresh_button.connect("clicked", lambda _button: self.lrefresh())
+        linux_toolbar.append(self.linux_refresh_button)
+
+    # Drag-and-drop already calls send()/recv(). Keep those methods and the
+    # hidden button objects intact because Win.buttons() still updates their
+    # sensitivity; simply remove the visible Send/Receive controls.
+    actions = self.sb.get_parent() if hasattr(self, "sb") else None
+    if actions is not None:
+        actions.remove(self.sb)
+        if hasattr(self, "rb") and self.rb.get_parent() is actions:
+            actions.remove(self.rb)
+
+
 def _resizable_init(self, app):
     # Suppress target auto-refresh while the saved drive/user values are being
     # restored by the original constructor.
@@ -113,6 +142,8 @@ def _resizable_init(self, app):
     self._target_refresh_source = 0
     _ORIGINAL_INIT(self, app)
     self._suppress_target_refresh = False
+
+    _install_usability_controls(self)
 
     found = _find_two_frame_box(self)
     if found is None:
