@@ -10,6 +10,7 @@ and layers UI refinements over the development dual-pane window:
 * manual refresh buttons for the Linux directory and serial-port list
 * drag-and-drop-only file transfer controls; Send/Receive buttons are hidden
 * startup settings restore without overwriting the saved baud rate
+* double-click Linux directory navigation
 """
 from __future__ import annotations
 
@@ -130,6 +131,11 @@ def _target_changed(self, *args):
 
 def _install_usability_controls(self):
     """Add manual refresh controls and make drag-and-drop the transfer UI."""
+    # Gtk.ListBox defaults to activate-on-single-click=True. Require activation
+    # by double-click instead; the existing row-activated handler then descends
+    # into directories with the normal GTK activation behavior.
+    self.ll.set_activate_on_single_click(False)
+
     # Adw.ActionRow inserts suffix widgets into an internal container, so the
     # dropdown's immediate GTK parent is not the ActionRow itself. Walk upward
     # to find the owning row, then add the serial refresh button beside it.
