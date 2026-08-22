@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Launch the dual-pane Host Link UI with a draggable Linux/CP/M divider.
+"""Shared production UI support for the S-100 Host Link desktop application.
 
-This builds on launch_dualpane.py, which installs the GVFS/SMB-safe GET path,
-and layers UI refinements over the development dual-pane window:
+This layer builds on launch_dualpane.py and provides the common behavior used by
+the model-backed file panes in launch_listview.py:
 
-* native draggable Gtk.Paned divider
-* reliable Linux/CP/M row selection using ListBox row indexes
-* automatic, debounced CP/M directory refresh after drive/user changes
-* manual refresh buttons for the Linux directory and serial-port list
-* drag-and-drop-only file transfer controls; Send/Receive buttons are hidden
+* draggable Linux/CP/M pane divider
+* sequential multi-file transfers in either direction
+* automatic CP/M directory refresh after drive/user changes
+* manual refresh controls for Linux files and serial ports
+* drag-and-drop-only transfer controls; Send/Receive buttons stay hidden
 * startup settings restore without overwriting the saved baud rate
 """
 from __future__ import annotations
+
+import threading
+from pathlib import Path
 
 import launch_dualpane as base
 
@@ -22,6 +25,8 @@ GLib = base.ui.GLib
 _ORIGINAL_INIT = base.ui.Win.__init__
 _ORIGINAL_TARGET = base.ui.Win.target
 _ORIGINAL_SAVE = base.ui.Win.save
+_ORIGINAL_DONE = base.ui.Win.done
+_ORIGINAL_ERR = base.ui.Win.err
 
 
 def _children(widget):
@@ -32,7 +37,6 @@ def _children(widget):
 
 
 def _find_ancestor(widget, widget_type):
-    """Return the first parent/ancestor matching widget_type."""
     parent = widget.get_parent()
     while parent is not None:
         if isinstance(parent, widget_type):
@@ -42,7 +46,6 @@ def _find_ancestor(widget, widget_type):
 
 
 def _find_two_frame_box(widget):
-    """Find the horizontal box that currently holds Linux and CP/M frames."""
     for child in _children(widget):
         if isinstance(child, Gtk.Box) and child.get_orientation() == Gtk.Orientation.HORIZONTAL:
             kids = list(_children(child))
@@ -52,47 +55,6 @@ def _find_two_frame_box(widget):
         if found is not None:
             return found
     return None
-
-
-def _linux_path_for_row(self, row):
-    """Return the Linux Path represented by a ListBox row.
-
-    Do not use Python id(row) here. PyGObject may hand a signal callback a
-    different Python wrapper for the same underlying GTK object, which left the
-    visible row selected while Send stayed disabled. Dict insertion order
-    matches the row insertion order, so the GTK row index is stable here.
-    """
-    if row is None:
-        return None
-    index = row.get_index()
-    entries = list(self.lrows.values())
-    if 0 <= index < len(entries):
-        return entries[index]
-    return None
-
-
-def _linux_selected(self, _listbox, row):
-    path = _linux_path_for_row(self, row)
-    self.lsel = path if path is not None and path.is_file() else None
-    self.buttons()
-
-
-def _linux_activated(self, _listbox, row):
-    path = _linux_path_for_row(self, row)
-    if path is not None and path.is_dir():
-        self.setdir(path)
-    elif path is not None and path.is_file():
-        self.lsel = path
-        self.buttons()
-
-
-def _cpm_selected(self, _listbox, row):
-    if row is None:
-        self.csel = None
-    else:
-        index = row.get_index()
-        self.csel = self.cfiles[index] if 0 <= index < len(self.cfiles) else None
-    self.buttons()
 
 
 def _save_settings(self, *args):
@@ -106,8 +68,6 @@ def _target_changed(self, *args):
     """Save drive/user and automatically refresh the selected CP/M directory."""
     _ORIGINAL_TARGET(self, *args)
 
-    # restore() sets drive then user during application startup. Preserve that
-    # behavior without issuing one or two surprise serial requests on launch.
     if getattr(self, "_suppress_target_refresh", False):
         return
 
@@ -118,7 +78,6 @@ def _target_changed(self, *args):
         except Exception:
             pass
 
-    # A short debounce combines a quick drive+user change into one HOST request.
     def refresh_selected_target():
         self._target_refresh_source = 0
         if not self.busy and self.port():
@@ -128,11 +87,247 @@ def _target_changed(self, *args):
     self._target_refresh_source = GLib.timeout_add(250, refresh_selected_target)
 
 
+def _duplicate_cpm_names(paths):
+    names = {}
+    duplicates = []
+    for path in paths:
+        remote = base.ui.cpm_filename(str(path))
+        key = remote.upper()
+        if key in names and key not in duplicates:
+            duplicates.append(key)
+        names[key] = path
+    return duplicates
+
+
+def _start_send_batch(self, paths):
+    """Send one or more Linux files sequentially over a single serial session."""
+    if self.busy or not self.port():
+        return False
+
+    clean = []
+    seen = set()
+    for path in paths:
+        path = Path(path)
+        try:
+            key = str(path.resolve())
+        except OSError:
+            key = str(path)
+        if path.is_file() and key not in seen:
+            clean.append(path)
+            seen.add(key)
+
+    if not clean:
+        return False
+
+    duplicates = _duplicate_cpm_names(clean)
+    if duplicates:
+        self.toast(
+            "Selected Linux files map to the same CP/M 8.3 filename: "
+            + ", ".join(duplicates)
+        )
+        return False
+
+    count = len(clean)
+    self._batch_refresh_cpm_on_error = True
+    self._batch_refresh_linux_on_error = False
+    label = f"Sending {clean[0].name}…" if count == 1 else f"Sending {count} files…"
+    self.begin(label)
+    self.worker = threading.Thread(
+        target=_send_batch_worker,
+        args=(self, clean),
+        daemon=True,
+    )
+    self.worker.start()
+    return True
+
+
+def _send_batch_worker(self, paths):
+    total_bytes = 0
+    total_blocks = 0
+    total_retries = 0
+    completed = 0
+    count = len(paths)
+
+    try:
+        with self.ser() as ser:
+            link = self.link(ser)
+            for index, path in enumerate(paths, start=1):
+                self._batch_progress_prefix = (
+                    f"Sending {path.name}"
+                    if count == 1
+                    else f"Sending {index}/{count}: {path.name}"
+                )
+                stats = link.send_file(
+                    str(path),
+                    base.ui.cpm_filename(str(path)),
+                    self.drive(),
+                    self.user(),
+                )
+                total_bytes += stats.bytes_in_file
+                total_blocks += stats.blocks_sent
+                total_retries += stats.retries
+                completed += 1
+
+        aggregate = base.ui.TransferStats(
+            bytes_in_file=total_bytes,
+            blocks_sent=total_blocks,
+            retries=total_retries,
+            mode="HOST2/BATCH" if count > 1 else "HOST2/CRC",
+        )
+        GLib.idle_add(_send_batch_done, self, aggregate, count)
+    except Exception as exc:
+        message = str(exc)
+        if count > 1:
+            message = f"Batch stopped after {completed}/{count} file(s): {message}"
+        GLib.idle_add(_batch_error, self, message)
+
+
+def _send_batch_done(self, stats, count):
+    self._batch_progress_prefix = ""
+    self._batch_refresh_cpm_on_error = False
+    self._batch_refresh_linux_on_error = False
+    verb = "Sent" if count == 1 else f"Sent {count} files"
+    return _ORIGINAL_DONE(self, stats, verb)
+
+
+def _unique_destination(directory, name, reserved):
+    destination = directory / name
+    stem = Path(name).stem
+    suffix = Path(name).suffix
+    counter = 1
+    while destination.exists() or destination in reserved:
+        destination = directory / f"{stem}_{counter}{suffix}"
+        counter += 1
+    reserved.add(destination)
+    return destination
+
+
+def _start_receive_batch(self, files):
+    """Receive one or more CP/M files sequentially over a single serial session."""
+    if self.busy or not self.port():
+        return False
+
+    clean = []
+    seen = set()
+    for item in files:
+        key = item.name.upper()
+        if key not in seen:
+            clean.append(item)
+            seen.add(key)
+
+    if not clean:
+        return False
+
+    reserved = set()
+    destinations = [
+        (item, _unique_destination(self.ldir, item.name, reserved))
+        for item in clean
+    ]
+
+    count = len(destinations)
+    self._batch_refresh_cpm_on_error = False
+    self._batch_refresh_linux_on_error = True
+    label = (
+        f"Receiving {destinations[0][0].name}…"
+        if count == 1
+        else f"Receiving {count} files…"
+    )
+    self.begin(label)
+    self.worker = threading.Thread(
+        target=_receive_batch_worker,
+        args=(self, destinations),
+        daemon=True,
+    )
+    self.worker.start()
+    return True
+
+
+def _receive_batch_worker(self, transfers):
+    total_bytes = 0
+    total_blocks = 0
+    total_retries = 0
+    completed = 0
+    count = len(transfers)
+
+    try:
+        with self.ser() as ser:
+            link = self.link(ser)
+            for index, (item, destination) in enumerate(transfers, start=1):
+                self._batch_progress_prefix = (
+                    f"Receiving {item.name}"
+                    if count == 1
+                    else f"Receiving {index}/{count}: {item.name}"
+                )
+                stats = link.receive_file(
+                    item.name,
+                    str(destination),
+                    self.drive(),
+                    self.user(),
+                    item.size_bytes,
+                )
+                total_bytes += stats.bytes_in_file
+                total_blocks += stats.blocks_sent
+                total_retries += stats.retries
+                completed += 1
+
+        aggregate = base.ui.TransferStats(
+            bytes_in_file=total_bytes,
+            blocks_sent=total_blocks,
+            retries=total_retries,
+            mode="HOST2/GET-BATCH" if count > 1 else "HOST2/GET",
+        )
+        GLib.idle_add(_receive_batch_done, self, aggregate, count)
+    except Exception as exc:
+        message = str(exc)
+        if count > 1:
+            message = f"Batch stopped after {completed}/{count} file(s): {message}"
+        GLib.idle_add(_batch_error, self, message)
+
+
+def _receive_batch_done(self, stats, count):
+    self._batch_progress_prefix = ""
+    self._batch_refresh_cpm_on_error = False
+    self._batch_refresh_linux_on_error = False
+    self.busy = False
+    self.prog.set_fraction(1)
+    if count == 1:
+        self.status.set_text("Receive complete")
+        self.log(f"Received {stats.bytes_in_file:,} bytes")
+    else:
+        self.status.set_text(f"Received {count} files")
+        self.log(
+            f"Received {count} files: {stats.bytes_in_file:,} bytes, "
+            f"{stats.blocks_sent} CP/M record(s)"
+        )
+    self.lrefresh()
+    self.buttons()
+    return False
+
+
+def _batch_error(self, message):
+    self._batch_progress_prefix = ""
+    refresh_linux = getattr(self, "_batch_refresh_linux_on_error", False)
+    refresh_cpm = getattr(self, "_batch_refresh_cpm_on_error", False)
+    self._batch_refresh_cpm_on_error = False
+    self._batch_refresh_linux_on_error = False
+    result = _ORIGINAL_ERR(self, message)
+    if refresh_linux:
+        self.lrefresh()
+    if refresh_cpm:
+        GLib.timeout_add(350, self.after)
+    return result
+
+
+def _progress(self, done, total, stats):
+    fraction = 1 if not total else min(1, done / total)
+    self.prog.set_fraction(fraction)
+    prefix = getattr(self, "_batch_progress_prefix", "")
+    detail = f"{fraction * 100:.1f}% — block {stats.blocks_sent}"
+    self.status.set_text(f"{prefix} — {detail}" if prefix else detail)
+    return False
+
+
 def _install_usability_controls(self):
-    """Add manual refresh controls and make drag-and-drop the transfer UI."""
-    # Adw.ActionRow inserts suffix widgets into an internal container, so the
-    # dropdown's immediate GTK parent is not the ActionRow itself. Walk upward
-    # to find the owning row, then add the serial refresh button beside it.
     port_row = _find_ancestor(self.pdd, Adw.ActionRow)
     if port_row is not None:
         self.port_refresh_button = Gtk.Button.new_from_icon_name("view-refresh-symbolic")
@@ -150,9 +345,6 @@ def _install_usability_controls(self):
         self.linux_refresh_button.connect("clicked", lambda _button: self.lrefresh())
         linux_toolbar.append(self.linux_refresh_button)
 
-    # Drag-and-drop already calls send()/recv(). Keep those methods and the
-    # hidden button objects intact because Win.buttons() still updates their
-    # sensitivity; simply remove the visible Send/Receive controls.
     actions = self.sb.get_parent() if hasattr(self, "sb") else None
     if actions is not None:
         actions.remove(self.sb)
@@ -161,15 +353,16 @@ def _install_usability_controls(self):
 
 
 def _resizable_init(self, app):
-    # The base constructor does ui() -> refresh_ports() -> restore(). Selecting
-    # a serial port during refresh_ports() emits notify::selected and calls
-    # save(), while the baud widget is still at its default 9600. Suppress all
-    # settings writes until restore() has finished so a saved 115200 (or any
-    # other baud) is not overwritten during startup.
+    """Initialize common desktop behavior before file panes are replaced."""
     self._suppress_settings_save = True
     self._suppress_target_refresh = True
     self._target_refresh_source = 0
+    self._batch_progress_prefix = ""
+    self._batch_refresh_cpm_on_error = False
+    self._batch_refresh_linux_on_error = False
+
     _ORIGINAL_INIT(self, app)
+
     self._suppress_settings_save = False
     self._suppress_target_refresh = False
 
@@ -192,16 +385,13 @@ def _resizable_init(self, app):
     paned.set_shrink_start_child(False)
     paned.set_shrink_end_child(False)
 
-    # Keep either side useful even if the divider is dragged aggressively.
     linux_frame.set_size_request(320, -1)
     cpm_frame.set_size_request(320, -1)
     paned.set_start_child(linux_frame)
     paned.set_end_child(cpm_frame)
     holder.append(paned)
-
     self.pane_divider = paned
 
-    # Gtk.Paned needs an allocation before a true 50/50 position is meaningful.
     def center_divider():
         width = paned.get_allocated_width()
         if width > 0:
@@ -212,13 +402,10 @@ def _resizable_init(self, app):
     GLib.idle_add(center_divider)
 
 
-# Install behavior before the first Win instance is constructed, so the signal
-# connections created by Win.ui() bind to these corrected callbacks.
-base.ui.Win.lselected = _linux_selected
-base.ui.Win.lactivate = _linux_activated
-base.ui.Win.cselected = _cpm_selected
 base.ui.Win.save = _save_settings
 base.ui.Win.target = _target_changed
+base.ui.Win.pg = _progress
+base.ui.Win.err = _batch_error
 base.ui.Win.__init__ = _resizable_init
 
 if __name__ == "__main__":
