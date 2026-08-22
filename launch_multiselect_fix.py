@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Start Host Link with reliable multi-file drag-and-drop batching.
+"""Host Link multi-file selection using explicit per-file checkboxes.
 
-On the target GTK/PyGObject build, Gtk.ListBox visibly paints multiple rows as
-selected but get_selected_rows() can yield only the row involved in the current
-pointer interaction.  Read selection state from each Gtk.ListBoxRow directly
-instead.  The drop handler then resolves the dragged row back to the complete
-visible selection and starts the existing batch-transfer worker.
+Gtk.ListBox selection and row drag behavior varies across GTK/PyGObject builds.
+On the target Ubuntu system several rows can be painted as selected while the
+selection APIs still report only the drag-origin row.  Avoid that ambiguity by
+making batch membership explicit: check the files to copy, then drag any one
+of the checked files to the other pane.
+
+Dragging an unchecked file remains a normal one-file transfer.
 """
 from __future__ import annotations
 
@@ -16,208 +18,223 @@ import launch_resizable as multi
 Gtk = multi.Gtk
 
 _ORIGINAL_MULTI_INIT = multi._resizable_init
+_ORIGINAL_LREFRESH = multi.base.ui.Win.lrefresh
+_ORIGINAL_CRENDER = multi.base.ui.Win.crender
 
 
-def _selected_rows(listbox):
-    """Return rows whose own GTK selected state is true, in display order."""
-    rows = []
-    index = 0
-    while True:
-        row = listbox.get_row_at_index(index)
+def _linux_key(path: Path) -> str:
+    return str(Path(path))
+
+
+def _cpm_key(name: str) -> str:
+    return str(name).upper()
+
+
+def _linux_checked_paths(self):
+    """Return checked Linux files in visible row order."""
+    wanted = set(getattr(self, "_linux_checked", set()))
+    result = []
+    for path in self.lrows.values():
+        path = Path(path)
+        if path.is_file() and _linux_key(path) in wanted:
+            result.append(path)
+    return result
+
+
+def _cpm_checked_files(self):
+    """Return checked CP/M files in visible row order."""
+    wanted = set(getattr(self, "_cpm_checked", set()))
+    return [item for item in self.cfiles if _cpm_key(item.name) in wanted]
+
+
+def _set_linux_checked(self, button, path: Path):
+    key = _linux_key(path)
+    if button.get_active():
+        self._linux_checked.add(key)
+    else:
+        self._linux_checked.discard(key)
+    count = len(self._linux_checked)
+    self.status.set_text(
+        "Ready" if count == 0 else f"{count} Linux file(s) selected for copy"
+    )
+    if count:
+        self.log(f"Linux batch selection: {count} file(s)")
+
+
+def _set_cpm_checked(self, button, item):
+    key = _cpm_key(item.name)
+    if button.get_active():
+        self._cpm_checked.add(key)
+    else:
+        self._cpm_checked.discard(key)
+    count = len(self._cpm_checked)
+    self.status.set_text(
+        "Ready" if count == 0 else f"{count} CP/M file(s) selected for copy"
+    )
+    if count:
+        self.log(f"CP/M batch selection: {count} file(s)")
+
+
+def _prepend_checkbox(row, *, active=False, tooltip=""):
+    box = row.get_child()
+    if not isinstance(box, Gtk.Box):
+        return None
+    button = Gtk.CheckButton()
+    button.set_active(active)
+    button.set_valign(Gtk.Align.CENTER)
+    if tooltip:
+        button.set_tooltip_text(tooltip)
+    box.prepend(button)
+    return button
+
+
+def _linux_refresh(self):
+    """Refresh Linux pane and add a checkbox beside each file."""
+    self._linux_checked = set()
+    self._linux_checkbuttons = {}
+    result = _ORIGINAL_LREFRESH(self)
+
+    entries = list(self.lrows.values())
+    for index, path in enumerate(entries):
+        row = self.ll.get_row_at_index(index)
         if row is None:
-            break
-        try:
-            selected = bool(row.is_selected())
-        except (AttributeError, TypeError):
-            # Compatibility fallback for older bindings.  This is not expected
-            # on GTK4, but keeps the test branch usable if is_selected() is not
-            # exposed by a particular PyGObject package.
-            selected = any(
-                candidate.get_index() == index
-                for candidate in listbox.get_selected_rows()
-            )
-        if selected:
-            rows.append(row)
-        index += 1
-    return rows
+            continue
+        path = Path(path)
+        if not path.is_file():
+            continue
+        button = _prepend_checkbox(
+            row,
+            tooltip="Include this file in a multi-file transfer",
+        )
+        if button is None:
+            continue
+        key = _linux_key(path)
+        self._linux_checkbuttons[key] = button
+        button.connect("toggled", lambda b, p=path: _set_linux_checked(self, b, p))
+
+    return result
 
 
-def _linux_selected_paths(self):
-    """Return all visibly selected Linux files in row order."""
-    paths = []
-    for row in _selected_rows(self.ll):
-        path = multi._linux_path_for_row(self, row)
-        if path is not None and path.is_file():
-            paths.append(path)
-    return paths
+def _cpm_render(self, files):
+    """Render CP/M pane and add a checkbox beside each file."""
+    self._cpm_checked = set()
+    self._cpm_checkbuttons = {}
+    result = _ORIGINAL_CRENDER(self, files)
+
+    for index, item in enumerate(self.cfiles):
+        row = self.cl.get_row_at_index(index)
+        if row is None:
+            continue
+        button = _prepend_checkbox(
+            row,
+            tooltip="Include this file in a multi-file transfer",
+        )
+        if button is None:
+            continue
+        key = _cpm_key(item.name)
+        self._cpm_checkbuttons[key] = button
+        button.connect("toggled", lambda b, f=item: _set_cpm_checked(self, b, f))
+
+    return result
 
 
-def _cpm_selected_files(self):
-    """Return all visibly selected CP/M files in row order."""
-    files = []
-    for row in _selected_rows(self.cl):
-        index = row.get_index()
-        if 0 <= index < len(self.cfiles):
-            files.append(self.cfiles[index])
-    return files
+def _clear_linux_checks(self):
+    for button in getattr(self, "_linux_checkbuttons", {}).values():
+        if button.get_active():
+            button.set_active(False)
+    self._linux_checked.clear()
 
 
-def _linux_selected(self, _listbox, _row=None):
-    paths = _linux_selected_paths(self)
-    self.lsels = paths
-    self.lsel = paths[0] if paths else None
-    count = len(paths)
-    if count != getattr(self, "_linux_logged_selection_count", -1):
-        if count > 1:
-            self.log(f"Linux visible selection: {count} files")
-        self._linux_logged_selection_count = count
-    self.buttons()
-
-
-def _cpm_selected(self, _listbox, _row=None):
-    files = _cpm_selected_files(self)
-    self.csels = files
-    self.csel = files[0] if files else None
-    count = len(files)
-    if count != getattr(self, "_cpm_logged_selection_count", -1):
-        if count > 1:
-            self.log(f"CP/M visible selection: {count} files")
-        self._cpm_logged_selection_count = count
-    self.buttons()
+def _clear_cpm_checks(self):
+    for button in getattr(self, "_cpm_checkbuttons", {}).values():
+        if button.get_active():
+            button.set_active(False)
+    self._cpm_checked.clear()
 
 
 def _provider(self, value):
-    """Keep the normal one-file drag payload; batching is resolved on drop."""
+    """Keep drag payload simple; the destination resolves checked batch state."""
     return multi._ORIGINAL_PROVIDER(self, value)
 
 
-def _linux_transfer_set(self, dragged: Path):
-    """Resolve a Linux drag to all visibly selected files when appropriate."""
-    selected = _linux_selected_paths(self)
-    if len(selected) > 1 and dragged in selected:
-        self.log(f"Drop found {len(selected)} visibly selected Linux files")
-        return selected
-
-    # Gtk may clear/collapse the selection during the drag itself.  Keep the
-    # most recent true multi-selection recorded by the selection callback.
-    previous = list(getattr(self, "_linux_last_multi", []))
-    if len(previous) > 1 and dragged in previous:
-        self.log(f"Using remembered Linux selection: {len(previous)} files")
-        return previous
-
-    return [dragged]
-
-
-def _cpm_transfer_set(self, dragged_name: str):
-    """Resolve a CP/M drag to all visibly selected files when appropriate."""
-    key = dragged_name.upper()
-    selected = _cpm_selected_files(self)
-    if len(selected) > 1 and any(item.name.upper() == key for item in selected):
-        self.log(f"Drop found {len(selected)} visibly selected CP/M files")
-        return selected
-
-    previous = list(getattr(self, "_cpm_last_multi", []))
-    if len(previous) > 1 and any(item.name.upper() == key for item in previous):
-        self.log(f"Using remembered CP/M selection: {len(previous)} files")
-        return previous
-
-    return [item for item in self.cfiles if item.name.upper() == key][:1]
-
-
-def _remember_linux_selection(self):
-    paths = _linux_selected_paths(self)
-    if len(paths) > 1:
-        self._linux_last_multi = list(paths)
-        count = len(paths)
-        if count != getattr(self, "_linux_logged_selection_count", -1):
-            self.log(f"Linux visible selection: {count} files")
-            self._linux_logged_selection_count = count
-    elif not paths:
-        self._linux_last_multi = []
-    return True
-
-
-def _remember_cpm_selection(self):
-    files = _cpm_selected_files(self)
-    if len(files) > 1:
-        self._cpm_last_multi = list(files)
-        count = len(files)
-        if count != getattr(self, "_cpm_logged_selection_count", -1):
-            self.log(f"CP/M visible selection: {count} files")
-            self._cpm_logged_selection_count = count
-    elif not files:
-        self._cpm_last_multi = []
-    return True
-
-
-def _poll_visible_selection(self):
-    """Remember direct row state before a drag is able to collapse it."""
-    _remember_linux_selection(self)
-    _remember_cpm_selection(self)
-    return True
-
-
 def _drop_on_cpm(self, _target, value, _x, _y):
-    """Drop Linux file(s) onto CP/M, resolving batching at destination."""
-    batch = multi._decode_batch(value, self.LD)
-    if batch is not None:
-        paths = [Path(item) for item in batch]
+    """Copy one Linux file, or all checked Linux files, to CP/M."""
+    if not isinstance(value, str) or not value.startswith(self.LD):
+        return False
+
+    dragged = Path(value[len(self.LD):])
+    checked = _linux_checked_paths(self)
+    dragged_is_checked = _linux_key(dragged) in self._linux_checked
+
+    if dragged_is_checked and checked:
+        paths = checked
+        self.log(f"Dragging checked Linux batch: {len(paths)} file(s)")
     else:
-        if not isinstance(value, str) or not value.startswith(self.LD):
-            return False
-        dragged = Path(value[len(self.LD):])
-        paths = _linux_transfer_set(self, dragged)
+        paths = [dragged]
 
     self.log(f"Drop: transferring {len(paths)} Linux file(s) to CP/M")
-    result = multi._start_send_batch(self, paths)
-    self._linux_last_multi = []
-    return result
+    started = multi._start_send_batch(self, paths)
+    if started and dragged_is_checked:
+        _clear_linux_checks(self)
+    return started
 
 
 def _drop_on_linux(self, _target, value, _x, _y):
-    """Drop CP/M file(s) onto Linux, resolving batching at destination."""
-    batch = multi._decode_batch(value, self.CD)
-    if batch is not None:
-        by_name = {item.name.upper(): item for item in self.cfiles}
-        files = [by_name[name.upper()] for name in batch if name.upper() in by_name]
+    """Copy one CP/M file, or all checked CP/M files, to Linux."""
+    if not isinstance(value, str) or not value.startswith(self.CD):
+        return False
+
+    dragged_name = value[len(self.CD):]
+    checked = _cpm_checked_files(self)
+    dragged_is_checked = _cpm_key(dragged_name) in self._cpm_checked
+
+    if dragged_is_checked and checked:
+        files = checked
+        self.log(f"Dragging checked CP/M batch: {len(files)} file(s)")
     else:
-        if not isinstance(value, str) or not value.startswith(self.CD):
-            return False
-        dragged_name = value[len(self.CD):]
-        files = _cpm_transfer_set(self, dragged_name)
+        item = next(
+            (entry for entry in self.cfiles if entry.name.upper() == dragged_name.upper()),
+            None,
+        )
+        files = [item] if item is not None else []
 
     self.log(f"Drop: transferring {len(files)} CP/M file(s) to Linux")
-    result = multi._start_receive_batch(self, files)
-    self._cpm_last_multi = []
-    return result
+    started = multi._start_receive_batch(self, files)
+    if started and dragged_is_checked:
+        _clear_cpm_checks(self)
+    return started
 
 
 def _fixed_init(self, app):
-    self._linux_last_multi = []
-    self._cpm_last_multi = []
-    self._linux_logged_selection_count = -1
-    self._cpm_logged_selection_count = -1
+    self._linux_checked = set()
+    self._cpm_checked = set()
+    self._linux_checkbuttons = {}
+    self._cpm_checkbuttons = {}
 
     _ORIGINAL_MULTI_INIT(self, app)
 
-    # Sample direct row state frequently enough that an ordinary human drag
-    # cannot erase the preceding multi-selection before it has been remembered.
-    self._selection_poll_source = multi.GLib.timeout_add(
-        40, lambda: _poll_visible_selection(self)
+    # The checkbox is the authoritative batch selector.  Keep ordinary row
+    # selection single so a click/drag cannot create a second hidden selection
+    # state that disagrees with the checkboxes.
+    self.ll.set_selection_mode(Gtk.SelectionMode.SINGLE)
+    self.cl.set_selection_mode(Gtk.SelectionMode.SINGLE)
+    self.ll.set_tooltip_text(
+        "Check multiple files, then drag any checked file to CP/M. "
+        "Drag an unchecked file for a single-file copy."
     )
-    self.log("Multi-file drag support active: direct-row selection v6")
+    self.cl.set_tooltip_text(
+        "Check multiple files, then drag any checked file to Linux. "
+        "Drag an unchecked file for a single-file copy."
+    )
+    self.log("Multi-file drag support active: checkbox batching v7")
 
 
-# Replace the helper functions that launch_resizable's selection callbacks use,
-# plus the drop handlers that decide whether a drag is a single or batch copy.
-multi._linux_selected_paths = _linux_selected_paths
-multi._cpm_selected_files = _cpm_selected_files
-multi._linux_selected = _linux_selected
-multi._cpm_selected = _cpm_selected
+# Install before the first window is created.  The wrapped refresh/render methods
+# insert checkboxes every time either directory is rebuilt.
 multi._provider = _provider
-multi.base.ui.Win.lselected = _linux_selected
-multi.base.ui.Win.cselected = _cpm_selected
 multi.base.ui.Win.provider = _provider
+multi.base.ui.Win.lrefresh = _linux_refresh
+multi.base.ui.Win.crender = _cpm_render
 multi.base.ui.Win.dropc = _drop_on_cpm
 multi.base.ui.Win.dropl = _drop_on_linux
 multi.base.ui.Win.__init__ = _fixed_init
