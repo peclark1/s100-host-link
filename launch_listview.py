@@ -3,7 +3,7 @@
 
 This test launcher keeps the proven connection, directory, and batch-transfer
 logic from launch_resizable.py, but replaces the two Gtk.ListBox file panes with
-model-backed Gtk.ListView widgets.  Gtk.MultiSelection is the authoritative
+model-backed Gtk.ListView widgets. Gtk.MultiSelection is the authoritative
 selection model, so Ctrl/Shift/rubber-band selection can be carried into a drag
 without per-file checkboxes.
 """
@@ -73,6 +73,16 @@ def _selected_items(selection, store, *, transferable_only=True):
             continue
         items.append(item)
     return items
+
+
+def _find_ancestor(widget, widget_type):
+    """Return first parent/ancestor of widget that matches widget_type."""
+    parent = widget.get_parent() if widget is not None else None
+    while parent is not None:
+        if isinstance(parent, widget_type):
+            return parent
+        parent = parent.get_parent()
+    return None
 
 
 def _setup_row(self, side, _factory, list_item):
@@ -292,10 +302,12 @@ def _drop_on_linux(self, _target, value, _x, _y):
 
 
 def _install_listviews(self):
-    linux_scroll = self.ll.get_parent()
-    cpm_scroll = self.cl.get_parent()
-    if not isinstance(linux_scroll, Gtk.ScrolledWindow) or not isinstance(cpm_scroll, Gtk.ScrolledWindow):
-        self.log("WARNING: Could not replace legacy file lists with Gtk.ListView.")
+    # Gtk.ListBox may be wrapped in an implicit Gtk.Viewport by Gtk.ScrolledWindow,
+    # so do not assume the immediate parent is the scroller. Walk upward instead.
+    linux_scroll = _find_ancestor(self.ll, Gtk.ScrolledWindow)
+    cpm_scroll = _find_ancestor(self.cl, Gtk.ScrolledWindow)
+    if linux_scroll is None or cpm_scroll is None:
+        self.log("WARNING: Could not locate file-pane scrollers for Gtk.ListView.")
         return False
 
     self.lstore = Gio.ListStore.new(PaneItem)
@@ -338,6 +350,7 @@ def _install_listviews(self):
     self.cview.add_controller(cpm_drop)
     self._listview_cpm_drop = cpm_drop
 
+    # set_child() replaces the old viewport/listbox subtree with the ListView.
     linux_scroll.set_child(self.lview)
     cpm_scroll.set_child(self.cview)
     self.ll = self.lview
