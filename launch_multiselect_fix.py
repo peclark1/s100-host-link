@@ -1,129 +1,164 @@
 #!/usr/bin/env python3
 """Start Host Link with reliable multi-file drag-and-drop batching.
 
-Gtk.ListBox in MULTIPLE mode may collapse a selection to the row under the
-pointer as a drag starts.  By the time DragSource or DropTarget asks which rows
-are selected, GTK can therefore report only the row where the drag began.
-
-Avoid depending on GTK signal/gesture ordering.  A lightweight timer samples
-the actual ListBox selections while they are stable.  When a drag collapses a
-multi-selection, the drop handler can use the multi-selection that was observed
-immediately before the collapse.
+On the target GTK/PyGObject build, Gtk.ListBox visibly paints multiple rows as
+selected but get_selected_rows() can yield only the row involved in the current
+pointer interaction.  Read selection state from each Gtk.ListBoxRow directly
+instead.  The drop handler then resolves the dragged row back to the complete
+visible selection and starts the existing batch-transfer worker.
 """
 from __future__ import annotations
 
-import time
 from pathlib import Path
 
 import launch_resizable as multi
 
 Gtk = multi.Gtk
-GLib = multi.GLib
 
 _ORIGINAL_MULTI_INIT = multi._resizable_init
-_SELECTION_POLL_MS = 50
-_RECENT_MULTI_SECONDS = 2.0
+
+
+def _selected_rows(listbox):
+    """Return rows whose own GTK selected state is true, in display order."""
+    rows = []
+    index = 0
+    while True:
+        row = listbox.get_row_at_index(index)
+        if row is None:
+            break
+        try:
+            selected = bool(row.is_selected())
+        except (AttributeError, TypeError):
+            # Compatibility fallback for older bindings.  This is not expected
+            # on GTK4, but keeps the test branch usable if is_selected() is not
+            # exposed by a particular PyGObject package.
+            selected = any(
+                candidate.get_index() == index
+                for candidate in listbox.get_selected_rows()
+            )
+        if selected:
+            rows.append(row)
+        index += 1
+    return rows
+
+
+def _linux_selected_paths(self):
+    """Return all visibly selected Linux files in row order."""
+    paths = []
+    for row in _selected_rows(self.ll):
+        path = multi._linux_path_for_row(self, row)
+        if path is not None and path.is_file():
+            paths.append(path)
+    return paths
+
+
+def _cpm_selected_files(self):
+    """Return all visibly selected CP/M files in row order."""
+    files = []
+    for row in _selected_rows(self.cl):
+        index = row.get_index()
+        if 0 <= index < len(self.cfiles):
+            files.append(self.cfiles[index])
+    return files
 
 
 def _linux_selected(self, _listbox, _row=None):
-    paths = multi._linux_selected_paths(self)
+    paths = _linux_selected_paths(self)
     self.lsels = paths
     self.lsel = paths[0] if paths else None
+    count = len(paths)
+    if count != getattr(self, "_linux_logged_selection_count", -1):
+        if count > 1:
+            self.log(f"Linux visible selection: {count} files")
+        self._linux_logged_selection_count = count
     self.buttons()
 
 
 def _cpm_selected(self, _listbox, _row=None):
-    files = multi._cpm_selected_files(self)
+    files = _cpm_selected_files(self)
     self.csels = files
     self.csel = files[0] if files else None
+    count = len(files)
+    if count != getattr(self, "_cpm_logged_selection_count", -1):
+        if count > 1:
+            self.log(f"CP/M visible selection: {count} files")
+        self._cpm_logged_selection_count = count
     self.buttons()
 
 
-def _poll_selections(self):
-    """Remember stable multi-selections before a drag can collapse them."""
-    now = time.monotonic()
-
-    linux = multi._linux_selected_paths(self)
-    if len(linux) > 1:
-        self._linux_recent_multi = list(linux)
-        self._linux_recent_multi_time = now
-        count = len(linux)
-        if self._linux_last_logged_count != count:
-            self.log(f"Linux selection observed: {count} files")
-            self._linux_last_logged_count = count
-    elif len(linux) == 0:
-        self._linux_last_logged_count = 0
-
-    cpm = multi._cpm_selected_files(self)
-    if len(cpm) > 1:
-        self._cpm_recent_multi = list(cpm)
-        self._cpm_recent_multi_time = now
-        count = len(cpm)
-        if self._cpm_last_logged_count != count:
-            self.log(f"CP/M selection observed: {count} files")
-            self._cpm_last_logged_count = count
-    elif len(cpm) == 0:
-        self._cpm_last_logged_count = 0
-
-    return True
-
-
 def _provider(self, value):
-    """Keep the normal one-file drag payload; batching is decided on drop."""
+    """Keep the normal one-file drag payload; batching is resolved on drop."""
     return multi._ORIGINAL_PROVIDER(self, value)
 
 
 def _linux_transfer_set(self, dragged: Path):
-    """Choose the Linux files represented by this drag."""
-    current = multi._linux_selected_paths(self)
-    if len(current) > 1 and dragged in current:
-        self.log(f"Drop found {len(current)} currently selected Linux files")
-        return current
+    """Resolve a Linux drag to all visibly selected files when appropriate."""
+    selected = _linux_selected_paths(self)
+    if len(selected) > 1 and dragged in selected:
+        self.log(f"Drop found {len(selected)} visibly selected Linux files")
+        return selected
 
-    previous = list(getattr(self, "_linux_recent_multi", []))
-    age = time.monotonic() - getattr(self, "_linux_recent_multi_time", 0.0)
-    if (
-        len(previous) > 1
-        and dragged in previous
-        and age <= _RECENT_MULTI_SECONDS
-    ):
-        self.log(
-            f"Using pre-drag Linux selection: {len(previous)} files "
-            f"({age:.2f}s old)"
-        )
+    # Gtk may clear/collapse the selection during the drag itself.  Keep the
+    # most recent true multi-selection recorded by the selection callback.
+    previous = list(getattr(self, "_linux_last_multi", []))
+    if len(previous) > 1 and dragged in previous:
+        self.log(f"Using remembered Linux selection: {len(previous)} files")
         return previous
 
     return [dragged]
 
 
 def _cpm_transfer_set(self, dragged_name: str):
-    """Choose the CP/M files represented by this drag."""
+    """Resolve a CP/M drag to all visibly selected files when appropriate."""
     key = dragged_name.upper()
+    selected = _cpm_selected_files(self)
+    if len(selected) > 1 and any(item.name.upper() == key for item in selected):
+        self.log(f"Drop found {len(selected)} visibly selected CP/M files")
+        return selected
 
-    current = multi._cpm_selected_files(self)
-    if len(current) > 1 and any(item.name.upper() == key for item in current):
-        self.log(f"Drop found {len(current)} currently selected CP/M files")
-        return current
-
-    previous = list(getattr(self, "_cpm_recent_multi", []))
-    age = time.monotonic() - getattr(self, "_cpm_recent_multi_time", 0.0)
-    if (
-        len(previous) > 1
-        and any(item.name.upper() == key for item in previous)
-        and age <= _RECENT_MULTI_SECONDS
-    ):
-        self.log(
-            f"Using pre-drag CP/M selection: {len(previous)} files "
-            f"({age:.2f}s old)"
-        )
+    previous = list(getattr(self, "_cpm_last_multi", []))
+    if len(previous) > 1 and any(item.name.upper() == key for item in previous):
+        self.log(f"Using remembered CP/M selection: {len(previous)} files")
         return previous
 
     return [item for item in self.cfiles if item.name.upper() == key][:1]
 
 
+def _remember_linux_selection(self):
+    paths = _linux_selected_paths(self)
+    if len(paths) > 1:
+        self._linux_last_multi = list(paths)
+        count = len(paths)
+        if count != getattr(self, "_linux_logged_selection_count", -1):
+            self.log(f"Linux visible selection: {count} files")
+            self._linux_logged_selection_count = count
+    elif not paths:
+        self._linux_last_multi = []
+    return True
+
+
+def _remember_cpm_selection(self):
+    files = _cpm_selected_files(self)
+    if len(files) > 1:
+        self._cpm_last_multi = list(files)
+        count = len(files)
+        if count != getattr(self, "_cpm_logged_selection_count", -1):
+            self.log(f"CP/M visible selection: {count} files")
+            self._cpm_logged_selection_count = count
+    elif not files:
+        self._cpm_last_multi = []
+    return True
+
+
+def _poll_visible_selection(self):
+    """Remember direct row state before a drag is able to collapse it."""
+    _remember_linux_selection(self)
+    _remember_cpm_selection(self)
+    return True
+
+
 def _drop_on_cpm(self, _target, value, _x, _y):
     """Drop Linux file(s) onto CP/M, resolving batching at destination."""
-    # Remain compatible with a batch payload produced by an older test build.
     batch = multi._decode_batch(value, self.LD)
     if batch is not None:
         paths = [Path(item) for item in batch]
@@ -134,7 +169,9 @@ def _drop_on_cpm(self, _target, value, _x, _y):
         paths = _linux_transfer_set(self, dragged)
 
     self.log(f"Drop: transferring {len(paths)} Linux file(s) to CP/M")
-    return multi._start_send_batch(self, paths)
+    result = multi._start_send_batch(self, paths)
+    self._linux_last_multi = []
+    return result
 
 
 def _drop_on_linux(self, _target, value, _x, _y):
@@ -150,26 +187,31 @@ def _drop_on_linux(self, _target, value, _x, _y):
         files = _cpm_transfer_set(self, dragged_name)
 
     self.log(f"Drop: transferring {len(files)} CP/M file(s) to Linux")
-    return multi._start_receive_batch(self, files)
+    result = multi._start_receive_batch(self, files)
+    self._cpm_last_multi = []
+    return result
 
 
 def _fixed_init(self, app):
-    self._linux_recent_multi = []
-    self._cpm_recent_multi = []
-    self._linux_recent_multi_time = 0.0
-    self._cpm_recent_multi_time = 0.0
-    self._linux_last_logged_count = 0
-    self._cpm_last_logged_count = 0
+    self._linux_last_multi = []
+    self._cpm_last_multi = []
+    self._linux_logged_selection_count = -1
+    self._cpm_logged_selection_count = -1
 
     _ORIGINAL_MULTI_INIT(self, app)
-    self._selection_poll_source = GLib.timeout_add(
-        _SELECTION_POLL_MS, lambda: _poll_selections(self)
+
+    # Sample direct row state frequently enough that an ordinary human drag
+    # cannot erase the preceding multi-selection before it has been remembered.
+    self._selection_poll_source = multi.GLib.timeout_add(
+        40, lambda: _poll_visible_selection(self)
     )
-    self.log("Multi-file drag support active: polled selection batching v5")
+    self.log("Multi-file drag support active: direct-row selection v6")
 
 
-# Install patches before the first window is constructed so the DragSource and
-# DropTarget signal connections made by Win.ui()/Win.dnd() bind to these methods.
+# Replace the helper functions that launch_resizable's selection callbacks use,
+# plus the drop handlers that decide whether a drag is a single or batch copy.
+multi._linux_selected_paths = _linux_selected_paths
+multi._cpm_selected_files = _cpm_selected_files
 multi._linux_selected = _linux_selected
 multi._cpm_selected = _cpm_selected
 multi._provider = _provider
