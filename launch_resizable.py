@@ -6,12 +6,18 @@ and layers UI refinements over the development dual-pane window:
 
 * native draggable Gtk.Paned divider
 * reliable Linux/CP/M row selection using ListBox row indexes
+* Ctrl/Shift multi-selection on both Linux and CP/M file lists
+* multi-file drag-and-drop transfers in either direction
 * automatic, debounced CP/M directory refresh after drive/user changes
 * manual refresh buttons for the Linux directory and serial-port list
 * drag-and-drop-only file transfer controls; Send/Receive buttons are hidden
 * startup settings restore without overwriting the saved baud rate
 """
 from __future__ import annotations
+
+import json
+import threading
+from pathlib import Path
 
 import launch_dualpane as base
 
@@ -22,6 +28,11 @@ GLib = base.ui.GLib
 _ORIGINAL_INIT = base.ui.Win.__init__
 _ORIGINAL_TARGET = base.ui.Win.target
 _ORIGINAL_SAVE = base.ui.Win.save
+_ORIGINAL_PROVIDER = base.ui.Win.provider
+_ORIGINAL_DONE = base.ui.Win.done
+_ORIGINAL_ERR = base.ui.Win.err
+
+_BATCH_MARKER = "BATCH:"
 
 
 def _children(widget):
@@ -71,9 +82,32 @@ def _linux_path_for_row(self, row):
     return None
 
 
-def _linux_selected(self, _listbox, row):
-    path = _linux_path_for_row(self, row)
-    self.lsel = path if path is not None and path.is_file() else None
+def _linux_selected_paths(self):
+    """Return all selected Linux files in visible row order."""
+    rows = sorted(self.ll.get_selected_rows(), key=lambda row: row.get_index())
+    paths = []
+    for row in rows:
+        path = _linux_path_for_row(self, row)
+        if path is not None and path.is_file():
+            paths.append(path)
+    return paths
+
+
+def _cpm_selected_files(self):
+    """Return all selected CP/M files in visible row order."""
+    rows = sorted(self.cl.get_selected_rows(), key=lambda row: row.get_index())
+    files = []
+    for row in rows:
+        index = row.get_index()
+        if 0 <= index < len(self.cfiles):
+            files.append(self.cfiles[index])
+    return files
+
+
+def _linux_selected(self, _listbox, _row=None):
+    paths = _linux_selected_paths(self)
+    self.lsels = paths
+    self.lsel = paths[0] if paths else None
     self.buttons()
 
 
@@ -82,16 +116,17 @@ def _linux_activated(self, _listbox, row):
     if path is not None and path.is_dir():
         self.setdir(path)
     elif path is not None and path.is_file():
-        self.lsel = path
+        # Activation should not collapse a Ctrl/Shift multi-selection.
+        paths = _linux_selected_paths(self)
+        self.lsels = paths
+        self.lsel = paths[0] if paths else path
         self.buttons()
 
 
-def _cpm_selected(self, _listbox, row):
-    if row is None:
-        self.csel = None
-    else:
-        index = row.get_index()
-        self.csel = self.cfiles[index] if 0 <= index < len(self.cfiles) else None
+def _cpm_selected(self, _listbox, _row=None):
+    files = _cpm_selected_files(self)
+    self.csels = files
+    self.csel = files[0] if files else None
     self.buttons()
 
 
@@ -128,6 +163,312 @@ def _target_changed(self, *args):
     self._target_refresh_source = GLib.timeout_add(250, refresh_selected_target)
 
 
+def _provider(self, value):
+    """Encode the full current selection when a selected row is dragged."""
+    if isinstance(value, str) and value.startswith(self.LD):
+        dragged = Path(value[len(self.LD):])
+        paths = _linux_selected_paths(self)
+        if len(paths) > 1 and dragged in paths:
+            payload = self.LD + _BATCH_MARKER + json.dumps([str(path) for path in paths])
+            return _ORIGINAL_PROVIDER(self, payload)
+
+    if isinstance(value, str) and value.startswith(self.CD):
+        dragged_name = value[len(self.CD):]
+        files = _cpm_selected_files(self)
+        if len(files) > 1 and any(item.name == dragged_name for item in files):
+            payload = self.CD + _BATCH_MARKER + json.dumps([item.name for item in files])
+            return _ORIGINAL_PROVIDER(self, payload)
+
+    return _ORIGINAL_PROVIDER(self, value)
+
+
+def _decode_batch(value, prefix):
+    marker = prefix + _BATCH_MARKER
+    if not isinstance(value, str) or not value.startswith(marker):
+        return None
+    try:
+        decoded = json.loads(value[len(marker):])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(decoded, list):
+        return []
+    return [str(item) for item in decoded if isinstance(item, str) and item]
+
+
+def _duplicate_cpm_names(paths):
+    names = {}
+    duplicates = []
+    for path in paths:
+        remote = base.ui.cpm_filename(str(path))
+        key = remote.upper()
+        if key in names and key not in duplicates:
+            duplicates.append(key)
+        names[key] = path
+    return duplicates
+
+
+def _start_send_batch(self, paths):
+    if self.busy or not self.port():
+        return False
+
+    clean = []
+    seen = set()
+    for path in paths:
+        path = Path(path)
+        try:
+            key = str(path.resolve())
+        except OSError:
+            key = str(path)
+        if path.is_file() and key not in seen:
+            clean.append(path)
+            seen.add(key)
+
+    if not clean:
+        return False
+
+    duplicates = _duplicate_cpm_names(clean)
+    if duplicates:
+        self.toast(
+            "Selected Linux files map to the same CP/M 8.3 filename: "
+            + ", ".join(duplicates)
+        )
+        return False
+
+    count = len(clean)
+    self._batch_refresh_cpm_on_error = True
+    self._batch_refresh_linux_on_error = False
+    label = f"Sending {clean[0].name}…" if count == 1 else f"Sending {count} files…"
+    self.begin(label)
+    self.worker = threading.Thread(
+        target=_send_batch_worker,
+        args=(self, clean),
+        daemon=True,
+    )
+    self.worker.start()
+    return True
+
+
+def _send_batch_worker(self, paths):
+    total_bytes = 0
+    total_blocks = 0
+    total_retries = 0
+    completed = 0
+    count = len(paths)
+
+    try:
+        with self.ser() as ser:
+            link = self.link(ser)
+            for index, path in enumerate(paths, start=1):
+                self._batch_progress_prefix = (
+                    f"Sending {path.name}"
+                    if count == 1
+                    else f"Sending {index}/{count}: {path.name}"
+                )
+                stats = link.send_file(
+                    str(path),
+                    base.ui.cpm_filename(str(path)),
+                    self.drive(),
+                    self.user(),
+                )
+                total_bytes += stats.bytes_in_file
+                total_blocks += stats.blocks_sent
+                total_retries += stats.retries
+                completed += 1
+
+        aggregate = base.ui.TransferStats(
+            bytes_in_file=total_bytes,
+            blocks_sent=total_blocks,
+            retries=total_retries,
+            mode="HOST2/BATCH" if count > 1 else "HOST2/CRC",
+        )
+        GLib.idle_add(_send_batch_done, self, aggregate, count)
+    except Exception as exc:
+        message = str(exc)
+        if count > 1:
+            message = f"Batch stopped after {completed}/{count} file(s): {message}"
+        GLib.idle_add(_batch_error, self, message)
+
+
+def _send_batch_done(self, stats, count):
+    self._batch_progress_prefix = ""
+    self._batch_refresh_cpm_on_error = False
+    self._batch_refresh_linux_on_error = False
+    verb = "Sent" if count == 1 else f"Sent {count} files"
+    return _ORIGINAL_DONE(self, stats, verb)
+
+
+def _unique_destination(directory, name, reserved):
+    destination = directory / name
+    stem = Path(name).stem
+    suffix = Path(name).suffix
+    counter = 1
+    while destination.exists() or destination in reserved:
+        destination = directory / f"{stem}_{counter}{suffix}"
+        counter += 1
+    reserved.add(destination)
+    return destination
+
+
+def _start_receive_batch(self, files):
+    if self.busy or not self.port():
+        return False
+
+    clean = []
+    seen = set()
+    for item in files:
+        key = item.name.upper()
+        if key not in seen:
+            clean.append(item)
+            seen.add(key)
+
+    if not clean:
+        return False
+
+    reserved = set()
+    destinations = [
+        (item, _unique_destination(self.ldir, item.name, reserved))
+        for item in clean
+    ]
+
+    count = len(destinations)
+    self._batch_refresh_cpm_on_error = False
+    self._batch_refresh_linux_on_error = True
+    label = (
+        f"Receiving {destinations[0][0].name}…"
+        if count == 1
+        else f"Receiving {count} files…"
+    )
+    self.begin(label)
+    self.worker = threading.Thread(
+        target=_receive_batch_worker,
+        args=(self, destinations),
+        daemon=True,
+    )
+    self.worker.start()
+    return True
+
+
+def _receive_batch_worker(self, transfers):
+    total_bytes = 0
+    total_blocks = 0
+    total_retries = 0
+    completed = 0
+    count = len(transfers)
+
+    try:
+        with self.ser() as ser:
+            link = self.link(ser)
+            for index, (item, destination) in enumerate(transfers, start=1):
+                self._batch_progress_prefix = (
+                    f"Receiving {item.name}"
+                    if count == 1
+                    else f"Receiving {index}/{count}: {item.name}"
+                )
+                stats = link.receive_file(
+                    item.name,
+                    str(destination),
+                    self.drive(),
+                    self.user(),
+                    item.size_bytes,
+                )
+                total_bytes += stats.bytes_in_file
+                total_blocks += stats.blocks_sent
+                total_retries += stats.retries
+                completed += 1
+
+        aggregate = base.ui.TransferStats(
+            bytes_in_file=total_bytes,
+            blocks_sent=total_blocks,
+            retries=total_retries,
+            mode="HOST2/GET-BATCH" if count > 1 else "HOST2/GET",
+        )
+        GLib.idle_add(_receive_batch_done, self, aggregate, count)
+    except Exception as exc:
+        message = str(exc)
+        if count > 1:
+            message = f"Batch stopped after {completed}/{count} file(s): {message}"
+        GLib.idle_add(_batch_error, self, message)
+
+
+def _receive_batch_done(self, stats, count):
+    self._batch_progress_prefix = ""
+    self._batch_refresh_cpm_on_error = False
+    self._batch_refresh_linux_on_error = False
+    self.busy = False
+    self.prog.set_fraction(1)
+    if count == 1:
+        self.status.set_text("Receive complete")
+        self.log(f"Received {stats.bytes_in_file:,} bytes")
+    else:
+        self.status.set_text(f"Received {count} files")
+        self.log(
+            f"Received {count} files: {stats.bytes_in_file:,} bytes, "
+            f"{stats.blocks_sent} CP/M record(s)"
+        )
+    self.lrefresh()
+    self.buttons()
+    return False
+
+
+def _batch_error(self, message):
+    self._batch_progress_prefix = ""
+    refresh_linux = getattr(self, "_batch_refresh_linux_on_error", False)
+    refresh_cpm = getattr(self, "_batch_refresh_cpm_on_error", False)
+    self._batch_refresh_cpm_on_error = False
+    self._batch_refresh_linux_on_error = False
+    result = _ORIGINAL_ERR(self, message)
+    if refresh_linux:
+        self.lrefresh()
+    if refresh_cpm:
+        GLib.timeout_add(350, self.after)
+    return result
+
+
+def _progress(self, done, total, stats):
+    fraction = 1 if not total else min(1, done / total)
+    self.prog.set_fraction(fraction)
+    prefix = getattr(self, "_batch_progress_prefix", "")
+    detail = f"{fraction * 100:.1f}% — block {stats.blocks_sent}"
+    self.status.set_text(f"{prefix} — {detail}" if prefix else detail)
+    return False
+
+
+def _send_selected(self, *_args):
+    return _start_send_batch(self, _linux_selected_paths(self))
+
+
+def _receive_selected(self, *_args):
+    return _start_receive_batch(self, _cpm_selected_files(self))
+
+
+def _drop_on_cpm(self, _target, value, _x, _y):
+    batch = _decode_batch(value, self.LD)
+    if batch is not None:
+        return _start_send_batch(self, [Path(item) for item in batch])
+
+    if not isinstance(value, str) or not value.startswith(self.LD):
+        return False
+    path = Path(value[len(self.LD):])
+    return _start_send_batch(self, [path])
+
+
+def _drop_on_linux(self, _target, value, _x, _y):
+    batch = _decode_batch(value, self.CD)
+    if batch is not None:
+        wanted = {name.upper() for name in batch}
+        files = [item for item in self.cfiles if item.name.upper() in wanted]
+        # Preserve the order encoded by the drag source.
+        by_name = {item.name.upper(): item for item in files}
+        ordered = [by_name[name.upper()] for name in batch if name.upper() in by_name]
+        return _start_receive_batch(self, ordered)
+
+    if not isinstance(value, str) or not value.startswith(self.CD):
+        return False
+    name = value[len(self.CD):]
+    item = next((entry for entry in self.cfiles if entry.name == name), None)
+    return _start_receive_batch(self, [item] if item is not None else [])
+
+
 def _install_usability_controls(self):
     """Add manual refresh controls and make drag-and-drop the transfer UI."""
     # Adw.ActionRow inserts suffix widgets into an internal container, so the
@@ -160,6 +501,39 @@ def _install_usability_controls(self):
             actions.remove(self.rb)
 
 
+def _install_multi_selection(self):
+    """Enable normal Ctrl/Shift multi-selection in both file panes."""
+    self.ll.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
+    self.cl.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
+
+    self.ll.set_tooltip_text(
+        "Ctrl-click or Shift-click to select multiple Linux files; "
+        "drag any selected file to CP/M to copy the group."
+    )
+    self.cl.set_tooltip_text(
+        "Ctrl-click or Shift-click to select multiple CP/M files; "
+        "drag any selected file to Linux to copy the group."
+    )
+
+    # MULTIPLE selection has a dedicated aggregate-change signal. Keep the
+    # existing row-selected handlers for compatibility, but always recompute
+    # selection from ListBox.get_selected_rows().
+    self.ll.connect(
+        "selected-rows-changed",
+        lambda listbox: _linux_selected(self, listbox),
+    )
+    self.cl.connect(
+        "selected-rows-changed",
+        lambda listbox: _cpm_selected(self, listbox),
+    )
+
+    self.lsels = _linux_selected_paths(self)
+    self.csels = _cpm_selected_files(self)
+    self.lsel = self.lsels[0] if self.lsels else None
+    self.csel = self.csels[0] if self.csels else None
+    self.buttons()
+
+
 def _resizable_init(self, app):
     # The base constructor does ui() -> refresh_ports() -> restore(). Selecting
     # a serial port during refresh_ports() emits notify::selected and calls
@@ -169,11 +543,15 @@ def _resizable_init(self, app):
     self._suppress_settings_save = True
     self._suppress_target_refresh = True
     self._target_refresh_source = 0
+    self._batch_progress_prefix = ""
+    self._batch_refresh_cpm_on_error = False
+    self._batch_refresh_linux_on_error = False
     _ORIGINAL_INIT(self, app)
     self._suppress_settings_save = False
     self._suppress_target_refresh = False
 
     _install_usability_controls(self)
+    _install_multi_selection(self)
 
     found = _find_two_frame_box(self)
     if found is None:
@@ -219,6 +597,13 @@ base.ui.Win.lactivate = _linux_activated
 base.ui.Win.cselected = _cpm_selected
 base.ui.Win.save = _save_settings
 base.ui.Win.target = _target_changed
+base.ui.Win.provider = _provider
+base.ui.Win.send = _send_selected
+base.ui.Win.recv = _receive_selected
+base.ui.Win.dropc = _drop_on_cpm
+base.ui.Win.dropl = _drop_on_linux
+base.ui.Win.pg = _progress
+base.ui.Win.err = _batch_error
 base.ui.Win.__init__ = _resizable_init
 
 if __name__ == "__main__":
