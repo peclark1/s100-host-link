@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Launch the production dual-pane S-100 Host Link UI.
+"""Shared production UI support for the S-100 Host Link desktop application.
 
-This layer builds on launch_dualpane.py and provides the current desktop UI:
+This layer builds on launch_dualpane.py and provides the common behavior used by
+the model-backed file panes in launch_listview.py:
 
 * draggable Linux/CP/M pane divider
-* stable Linux row mapping for PyGObject
-* explicit per-file checkboxes for multi-file transfers
-* sequential batch transfers in either direction
+* sequential multi-file transfers in either direction
 * automatic CP/M directory refresh after drive/user changes
 * manual refresh controls for Linux files and serial ports
 * drag-and-drop-only transfer controls; Send/Receive buttons stay hidden
@@ -28,8 +27,6 @@ _ORIGINAL_TARGET = base.ui.Win.target
 _ORIGINAL_SAVE = base.ui.Win.save
 _ORIGINAL_DONE = base.ui.Win.done
 _ORIGINAL_ERR = base.ui.Win.err
-_ORIGINAL_LREFRESH = base.ui.Win.lrefresh
-_ORIGINAL_CRENDER = base.ui.Win.crender
 
 
 def _children(widget):
@@ -60,67 +57,15 @@ def _find_two_frame_box(widget):
     return None
 
 
-def _scan_linux_entries(self):
-    """Return directory entries in the same order used by the Linux pane."""
-    try:
-        return sorted(
-            self.ldir.iterdir(),
-            key=lambda path: (not path.is_dir(), path.name.casefold()),
-        )
-    except OSError:
-        return []
-
-
-def _rebuild_linux_row_map(self):
-    """Use stable row indexes instead of Python id(Gtk.ListBoxRow) keys."""
-    entries = _scan_linux_entries(self)
-    self.lrows = {index: path for index, path in enumerate(entries)}
-    return entries
-
-
-def _linux_path_for_row(self, row):
-    if row is None:
-        return None
-    index = row.get_index()
-    if index in self.lrows:
-        return self.lrows[index]
-    entries = list(self.lrows.values())
-    if 0 <= index < len(entries):
-        return entries[index]
-    return None
-
-
-def _linux_selected(self, _listbox, row):
-    path = _linux_path_for_row(self, row)
-    self.lsel = path if path is not None and path.is_file() else None
-    self.buttons()
-
-
-def _linux_activated(self, _listbox, row):
-    path = _linux_path_for_row(self, row)
-    if path is not None and path.is_dir():
-        self.setdir(path)
-    elif path is not None and path.is_file():
-        self.lsel = path
-        self.buttons()
-
-
-def _cpm_selected(self, _listbox, row):
-    if row is None:
-        self.csel = None
-    else:
-        index = row.get_index()
-        self.csel = self.cfiles[index] if 0 <= index < len(self.cfiles) else None
-    self.buttons()
-
-
 def _save_settings(self, *args):
+    """Avoid clobbering saved settings while startup widgets are initialized."""
     if getattr(self, "_suppress_settings_save", False):
         return
     return _ORIGINAL_SAVE(self, *args)
 
 
 def _target_changed(self, *args):
+    """Save drive/user and automatically refresh the selected CP/M directory."""
     _ORIGINAL_TARGET(self, *args)
 
     if getattr(self, "_suppress_target_refresh", False):
@@ -142,138 +87,6 @@ def _target_changed(self, *args):
     self._target_refresh_source = GLib.timeout_add(250, refresh_selected_target)
 
 
-def _linux_key(path: Path) -> str:
-    return str(Path(path))
-
-
-def _cpm_key(name: str) -> str:
-    return str(name).upper()
-
-
-def _linux_checked_paths(self):
-    wanted = set(getattr(self, "_linux_checked", set()))
-    result = []
-    for path in self.lrows.values():
-        path = Path(path)
-        if path.is_file() and _linux_key(path) in wanted:
-            result.append(path)
-    return result
-
-
-def _cpm_checked_files(self):
-    wanted = set(getattr(self, "_cpm_checked", set()))
-    return [item for item in self.cfiles if _cpm_key(item.name) in wanted]
-
-
-def _set_linux_checked(self, button, path: Path):
-    key = _linux_key(path)
-    if button.get_active():
-        self._linux_checked.add(key)
-    else:
-        self._linux_checked.discard(key)
-    if getattr(self, "_suppress_check_feedback", False):
-        return
-    count = len(self._linux_checked)
-    self.status.set_text(
-        "Ready" if count == 0 else f"{count} Linux file(s) selected for copy"
-    )
-
-
-def _set_cpm_checked(self, button, item):
-    key = _cpm_key(item.name)
-    if button.get_active():
-        self._cpm_checked.add(key)
-    else:
-        self._cpm_checked.discard(key)
-    if getattr(self, "_suppress_check_feedback", False):
-        return
-    count = len(self._cpm_checked)
-    self.status.set_text(
-        "Ready" if count == 0 else f"{count} CP/M file(s) selected for copy"
-    )
-
-
-def _prepend_checkbox(row, tooltip):
-    box = row.get_child()
-    if not isinstance(box, Gtk.Box):
-        return None
-    button = Gtk.CheckButton()
-    button.set_valign(Gtk.Align.CENTER)
-    button.set_tooltip_text(tooltip)
-    box.prepend(button)
-    return button
-
-
-def _linux_refresh(self):
-    self._linux_checked = set()
-    self._linux_checkbuttons = {}
-    result = _ORIGINAL_LREFRESH(self)
-
-    entries = _rebuild_linux_row_map(self)
-    for index, path in enumerate(entries):
-        row = self.ll.get_row_at_index(index)
-        if row is None:
-            continue
-        path = Path(path)
-        if not path.is_file():
-            continue
-        button = _prepend_checkbox(
-            row,
-            "Include this file in a multi-file transfer",
-        )
-        if button is None:
-            continue
-        key = _linux_key(path)
-        self._linux_checkbuttons[key] = button
-        button.connect("toggled", lambda b, p=path: _set_linux_checked(self, b, p))
-
-    return result
-
-
-def _cpm_render(self, files):
-    self._cpm_checked = set()
-    self._cpm_checkbuttons = {}
-    result = _ORIGINAL_CRENDER(self, files)
-
-    for index, item in enumerate(self.cfiles):
-        row = self.cl.get_row_at_index(index)
-        if row is None:
-            continue
-        button = _prepend_checkbox(
-            row,
-            "Include this file in a multi-file transfer",
-        )
-        if button is None:
-            continue
-        key = _cpm_key(item.name)
-        self._cpm_checkbuttons[key] = button
-        button.connect("toggled", lambda b, f=item: _set_cpm_checked(self, b, f))
-
-    return result
-
-
-def _clear_linux_checks(self):
-    self._suppress_check_feedback = True
-    try:
-        for button in getattr(self, "_linux_checkbuttons", {}).values():
-            if button.get_active():
-                button.set_active(False)
-        self._linux_checked.clear()
-    finally:
-        self._suppress_check_feedback = False
-
-
-def _clear_cpm_checks(self):
-    self._suppress_check_feedback = True
-    try:
-        for button in getattr(self, "_cpm_checkbuttons", {}).values():
-            if button.get_active():
-                button.set_active(False)
-        self._cpm_checked.clear()
-    finally:
-        self._suppress_check_feedback = False
-
-
 def _duplicate_cpm_names(paths):
     names = {}
     duplicates = []
@@ -287,6 +100,7 @@ def _duplicate_cpm_names(paths):
 
 
 def _start_send_batch(self, paths):
+    """Send one or more Linux files sequentially over a single serial session."""
     if self.busy or not self.port():
         return False
 
@@ -389,6 +203,7 @@ def _unique_destination(directory, name, reserved):
 
 
 def _start_receive_batch(self, files):
+    """Receive one or more CP/M files sequentially over a single serial session."""
     if self.busy or not self.port():
         return False
 
@@ -512,44 +327,6 @@ def _progress(self, done, total, stats):
     return False
 
 
-def _drop_on_cpm(self, _target, value, _x, _y):
-    if not isinstance(value, str) or not value.startswith(self.LD):
-        return False
-
-    dragged = Path(value[len(self.LD):])
-    checked = _linux_checked_paths(self)
-    dragged_is_checked = _linux_key(dragged) in self._linux_checked
-    paths = checked if dragged_is_checked and checked else [dragged]
-
-    started = _start_send_batch(self, paths)
-    if started and dragged_is_checked:
-        _clear_linux_checks(self)
-    return started
-
-
-def _drop_on_linux(self, _target, value, _x, _y):
-    if not isinstance(value, str) or not value.startswith(self.CD):
-        return False
-
-    dragged_name = value[len(self.CD):]
-    checked = _cpm_checked_files(self)
-    dragged_is_checked = _cpm_key(dragged_name) in self._cpm_checked
-
-    if dragged_is_checked and checked:
-        files = checked
-    else:
-        item = next(
-            (entry for entry in self.cfiles if entry.name.upper() == dragged_name.upper()),
-            None,
-        )
-        files = [item] if item is not None else []
-
-    started = _start_receive_batch(self, files)
-    if started and dragged_is_checked:
-        _clear_cpm_checks(self)
-    return started
-
-
 def _install_usability_controls(self):
     port_row = _find_ancestor(self.pdd, Adw.ActionRow)
     if port_row is not None:
@@ -576,17 +353,13 @@ def _install_usability_controls(self):
 
 
 def _resizable_init(self, app):
+    """Initialize common desktop behavior before file panes are replaced."""
     self._suppress_settings_save = True
     self._suppress_target_refresh = True
     self._target_refresh_source = 0
     self._batch_progress_prefix = ""
     self._batch_refresh_cpm_on_error = False
     self._batch_refresh_linux_on_error = False
-    self._linux_checked = set()
-    self._cpm_checked = set()
-    self._linux_checkbuttons = {}
-    self._cpm_checkbuttons = {}
-    self._suppress_check_feedback = False
 
     _ORIGINAL_INIT(self, app)
 
@@ -594,17 +367,6 @@ def _resizable_init(self, app):
     self._suppress_target_refresh = False
 
     _install_usability_controls(self)
-
-    self.ll.set_selection_mode(Gtk.SelectionMode.SINGLE)
-    self.cl.set_selection_mode(Gtk.SelectionMode.SINGLE)
-    self.ll.set_tooltip_text(
-        "Check multiple files, then drag any checked file to CP/M. "
-        "Drag an unchecked file for a single-file copy."
-    )
-    self.cl.set_tooltip_text(
-        "Check multiple files, then drag any checked file to Linux. "
-        "Drag an unchecked file for a single-file copy."
-    )
 
     found = _find_two_frame_box(self)
     if found is None:
@@ -628,7 +390,6 @@ def _resizable_init(self, app):
     paned.set_start_child(linux_frame)
     paned.set_end_child(cpm_frame)
     holder.append(paned)
-
     self.pane_divider = paned
 
     def center_divider():
@@ -641,15 +402,8 @@ def _resizable_init(self, app):
     GLib.idle_add(center_divider)
 
 
-base.ui.Win.lselected = _linux_selected
-base.ui.Win.lactivate = _linux_activated
-base.ui.Win.cselected = _cpm_selected
 base.ui.Win.save = _save_settings
 base.ui.Win.target = _target_changed
-base.ui.Win.lrefresh = _linux_refresh
-base.ui.Win.crender = _cpm_render
-base.ui.Win.dropc = _drop_on_cpm
-base.ui.Win.dropl = _drop_on_linux
 base.ui.Win.pg = _progress
 base.ui.Win.err = _batch_error
 base.ui.Win.__init__ = _resizable_init
