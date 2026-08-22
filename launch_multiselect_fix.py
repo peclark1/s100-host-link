@@ -3,11 +3,16 @@
 
 Gtk.ListBox selection and row drag behavior varies across GTK/PyGObject builds.
 On the target Ubuntu system several rows can be painted as selected while the
-selection APIs still report only the drag-origin row.  Avoid that ambiguity by
+selection APIs still report only the drag-origin row. Avoid that ambiguity by
 making batch membership explicit: check the files to copy, then drag any one
 of the checked files to the other pane.
 
 Dragging an unchecked file remains a normal one-file transfer.
+
+The original dual-pane UI keyed Linux rows by Python id(row). PyGObject may
+recycle those temporary wrapper objects, causing dictionary entries to be
+silently overwritten. Rebuild the Linux row mapping by stable ListBox row
+index after every refresh so every visible filesystem entry remains addressable.
 """
 from __future__ import annotations
 
@@ -28,6 +33,24 @@ def _linux_key(path: Path) -> str:
 
 def _cpm_key(name: str) -> str:
     return str(name).upper()
+
+
+def _scan_linux_entries(self):
+    """Return Linux directory entries in exactly the UI's display order."""
+    try:
+        return sorted(
+            self.ldir.iterdir(),
+            key=lambda path: (not path.is_dir(), path.name.casefold()),
+        )
+    except OSError:
+        return []
+
+
+def _rebuild_linux_row_map(self):
+    """Replace fragile id(row) keys with one stable entry per ListBox row."""
+    entries = _scan_linux_entries(self)
+    self.lrows = {index: path for index, path in enumerate(entries)}
+    return entries
 
 
 def _linux_checked_paths(self):
@@ -89,12 +112,18 @@ def _prepend_checkbox(row, *, active=False, tooltip=""):
 
 
 def _linux_refresh(self):
-    """Refresh Linux pane and add a checkbox beside each file."""
+    """Refresh Linux pane, repair row mapping, and checkbox every file."""
     self._linux_checked = set()
     self._linux_checkbuttons = {}
     result = _ORIGINAL_LREFRESH(self)
 
-    entries = list(self.lrows.values())
+    # _ORIGINAL_LREFRESH stores entries using id(Gtk.ListBoxRow). Those Python
+    # wrapper ids are not stable/unique for the lifetime of the GTK rows. Scan
+    # the directory again in the same sort order and map each path to its
+    # durable ListBox row index instead.
+    entries = _rebuild_linux_row_map(self)
+    file_count = 0
+
     for index, path in enumerate(entries):
         row = self.ll.get_row_at_index(index)
         if row is None:
@@ -102,15 +131,23 @@ def _linux_refresh(self):
         path = Path(path)
         if not path.is_file():
             continue
+
         button = _prepend_checkbox(
             row,
             tooltip="Include this file in a multi-file transfer",
         )
         if button is None:
             continue
+
         key = _linux_key(path)
         self._linux_checkbuttons[key] = button
         button.connect("toggled", lambda b, p=path: _set_linux_checked(self, b, p))
+        file_count += 1
+
+    # One concise diagnostic makes it obvious that the entire directory was
+    # decorated rather than only the subset formerly surviving in self.lrows.
+    if hasattr(self, "buf"):
+        self.log(f"Linux file list: {file_count} transferable file(s)")
 
     return result
 
@@ -213,7 +250,7 @@ def _fixed_init(self, app):
 
     _ORIGINAL_MULTI_INIT(self, app)
 
-    # The checkbox is the authoritative batch selector.  Keep ordinary row
+    # The checkbox is the authoritative batch selector. Keep ordinary row
     # selection single so a click/drag cannot create a second hidden selection
     # state that disagrees with the checkboxes.
     self.ll.set_selection_mode(Gtk.SelectionMode.SINGLE)
@@ -226,10 +263,10 @@ def _fixed_init(self, app):
         "Check multiple files, then drag any checked file to Linux. "
         "Drag an unchecked file for a single-file copy."
     )
-    self.log("Multi-file drag support active: checkbox batching v7")
+    self.log("Multi-file drag support active: checkbox batching v8")
 
 
-# Install before the first window is created.  The wrapped refresh/render methods
+# Install before the first window is created. The wrapped refresh/render methods
 # insert checkboxes every time either directory is rebuilt.
 multi._provider = _provider
 multi.base.ui.Win.provider = _provider
