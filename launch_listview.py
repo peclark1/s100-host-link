@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Experimental Gtk.ListView/Gtk.MultiSelection Host Link UI.
+"""Production Gtk.ListView/Gtk.MultiSelection Host Link UI.
 
-This test launcher keeps the proven connection, directory, and batch-transfer
-logic from launch_resizable.py, but replaces the two Gtk.ListBox file panes with
-model-backed Gtk.ListView widgets. Gtk.MultiSelection is the authoritative
-selection model, so Ctrl/Shift/rubber-band selection can be carried into a drag
-without per-file checkboxes.
+The two file panes use model-backed Gtk.ListView widgets with Gtk.MultiSelection
+as the authoritative selection model. Ctrl/Shift/Ctrl+A/rubber-band selection
+therefore remains stable while dragging, and dragging any selected file copies
+the entire selected set.
 """
 from __future__ import annotations
 
@@ -15,18 +14,12 @@ from pathlib import Path
 import launch_resizable as current
 
 base = current.base
-Adw = current.Adw
 Gtk = current.Gtk
-GLib = current.GLib
 Gdk = base.ui.Gdk
 Gio = base.ui.Gio
 GObject = base.ui.GObject
 
-_CHECKBOX_INIT = current._resizable_init
-_CHECKBOX_LREFRESH = current._linux_refresh
-_CHECKBOX_CRENDER = current._cpm_render
-_CHECKBOX_DROPC = current._drop_on_cpm
-_CHECKBOX_DROPL = current._drop_on_linux
+_BASE_INIT = current._resizable_init
 
 _LINUX_BATCH = "HL:L:LISTVIEW:"
 _CPM_BATCH = "HL:C:LISTVIEW:"
@@ -76,7 +69,6 @@ def _selected_items(selection, store, *, transferable_only=True):
 
 
 def _find_ancestor(widget, widget_type):
-    """Return first parent/ancestor of widget that matches widget_type."""
     parent = widget.get_parent() if widget is not None else None
     while parent is not None:
         if isinstance(parent, widget_type):
@@ -157,10 +149,7 @@ def _prepare_drag(self, side, list_item):
     if side == "linux":
         selection = self.lselection
         store = self.lstore
-        if selection.is_selected(position):
-            chosen = _selected_items(selection, store)
-        else:
-            chosen = [item]
+        chosen = _selected_items(selection, store) if selection.is_selected(position) else [item]
         paths = [str(entry.path) for entry in chosen if entry.path is not None]
         if not paths:
             return None
@@ -168,10 +157,7 @@ def _prepare_drag(self, side, list_item):
     else:
         selection = self.cselection
         store = self.cstore
-        if selection.is_selected(position):
-            chosen = _selected_items(selection, store)
-        else:
-            chosen = [item]
+        chosen = _selected_items(selection, store) if selection.is_selected(position) else [item]
         names = [entry.cpm_file.name for entry in chosen if entry.cpm_file is not None]
         if not names:
             return None
@@ -302,8 +288,7 @@ def _drop_on_linux(self, _target, value, _x, _y):
 
 
 def _install_listviews(self):
-    # Gtk.ListBox may be wrapped in an implicit Gtk.Viewport by Gtk.ScrolledWindow,
-    # so do not assume the immediate parent is the scroller. Walk upward instead.
+    # Gtk.ListBox may be wrapped in an implicit Gtk.Viewport by Gtk.ScrolledWindow.
     linux_scroll = _find_ancestor(self.ll, Gtk.ScrolledWindow)
     cpm_scroll = _find_ancestor(self.cl, Gtk.ScrolledWindow)
     if linux_scroll is None or cpm_scroll is None:
@@ -350,7 +335,6 @@ def _install_listviews(self):
     self.cview.add_controller(cpm_drop)
     self._listview_cpm_drop = cpm_drop
 
-    # set_child() replaces the old viewport/listbox subtree with the ListView.
     linux_scroll.set_child(self.lview)
     cpm_scroll.set_child(self.cview)
     self.ll = self.lview
@@ -367,13 +351,7 @@ def _install_listviews(self):
 
 
 def _listview_init(self, app):
-    base.ui.Win.lrefresh = _CHECKBOX_LREFRESH
-    base.ui.Win.crender = _CHECKBOX_CRENDER
-    base.ui.Win.dropc = _CHECKBOX_DROPC
-    base.ui.Win.dropl = _CHECKBOX_DROPL
-
-    _CHECKBOX_INIT(self, app)
-
+    _BASE_INIT(self, app)
     if _install_listviews(self):
         self.log("Multi-file selection active: Gtk.ListView + Gtk.MultiSelection")
 
