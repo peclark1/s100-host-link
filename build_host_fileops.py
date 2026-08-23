@@ -55,8 +55,10 @@ def patch_source(text: str) -> str:
             "Input is not the tested GET-capable HOST source; expected CMD_GET and GET_BEGIN."
         )
 
-    # Make the tested build visibly distinguishable at the CP/M console.
-    text = text.replace("v2.1", "v2.2")
+    # Make every inherited v2.1 reference visibly v2.2, including startup
+    # strings that may use either upper- or lower-case V before the number.
+    # Matching the numeric portion avoids depending on the exact banner style.
+    text = text.replace("2.1", "2.2")
 
     if "CMD_DELETE" not in text:
         text = regex_once(
@@ -93,7 +95,7 @@ def patch_source(text: str) -> str:
             "command dispatch",
         )
 
-    # Accept commands 01H through 06H.  Keep the original PC_CMDOK body intact.
+    # Accept commands 01H through 06H. Keep the original PC_CMDOK body intact.
     parse_pattern = (
         r"(?ms)(^\s*LDA\s+DMABUF\+8\s*\n)"
         r".*?"
@@ -117,9 +119,9 @@ def patch_source(text: str) -> str:
     )
     text = regex_once(text, parse_pattern, parse_replacement, "PARSECOMMAND validation")
 
-    # The GET-capable source already prepares an FCB for GET and PUT.  New file
+    # The GET-capable source already prepares an FCB for GET and PUT. New file
     # operations also need that old-name FCB, but only PUT may delete/create the
-    # destination before data transfer.  Guard the existing PUT make sequence.
+    # destination before data transfer. Guard the existing PUT make sequence.
     put_guard = (
         "        LDA     COMMAND\n"
         "        CPI     CMD_PUT\n"
@@ -136,7 +138,7 @@ def patch_source(text: str) -> str:
 
     handlers = r"""
 ; ---------------------------------------------------------------------------
-; Metadata-only file management commands.  PARSECOMMAND has already selected
+; Metadata-only file management commands. PARSECOMMAND has already selected
 ; the requested drive/user and built FCB from command bytes 11..21.
 ; Success is reported with EOT (Linux ACKs it); BDOS failure is CAN CAN.
 ; ---------------------------------------------------------------------------
@@ -202,7 +204,7 @@ AT_SYS_CLEAR:
         STA     FCB+10
 
 AT_ARC:
-        ; t3' = ARC under CP/M 3.  CP/M 2.2 formally reserves this bit.
+        ; t3' = ARC under CP/M 3. CP/M 2.2 formally reserves this bit.
         LDA     DMABUF+37
         ANI     004H
         JZ      AT_ARC_CLEAR
@@ -244,6 +246,14 @@ FILEOP_LINK_ERROR:
             "file-operation handlers",
         )
 
+    # Fail the build rather than silently shipping a HOST22 source that still
+    # identifies itself as 2.1. This also catches future changes to the base
+    # source's banner formatting.
+    if "2.1" in text:
+        raise PatchError("v2.1 version text remains after HOST22 patching")
+    if "2.2" not in text:
+        raise PatchError("HOST22 source does not contain a v2.2 version string")
+
     return text
 
 
@@ -278,7 +288,21 @@ def main() -> int:
     completed = subprocess.run(command, cwd=HERE)
     if completed.returncode:
         return completed.returncode
-    print(f"Built {args.com}")
+
+    try:
+        image = args.com.read_bytes()
+    except OSError as exc:
+        print(f"error: could not verify {args.com}: {exc}", file=sys.stderr)
+        return 1
+    if b"2.1" in image or b"2.2" not in image:
+        print(
+            f"error: {args.com} version verification failed "
+            "(expected embedded 2.2 banner and no 2.1 text)",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"Built {args.com} (verified v2.2 banner)")
     return 0
 
 
