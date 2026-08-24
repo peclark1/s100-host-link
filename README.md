@@ -28,6 +28,7 @@ HOST v2.2 supports:
 - ATTR: R/O, SYS, and CP/M 3 ARC
 - explicit CP/M drive and user-area selection
 - multi-file drag/drop in both directions from the Linux GUI
+- external Linux editor workflow for CP/M files
 
 The v2.2 path has been successfully exercised on the physical IMSAI with the Serial I/O V3 USB connection.
 
@@ -45,7 +46,31 @@ Launch:
 ./run.sh
 ```
 
-`run.sh` starts the current production file-management UI in `launch_fileops.py`.
+`run.sh` starts the production UI through `launch_targetsim.py`, which includes the file-management, external-editor, and targetsim serial-discovery layers.
+
+## Edit a CP/M file with a Linux editor
+
+Right-click a single file in the CP/M pane and choose **Edit…**. Host Link will:
+
+1. receive the CP/M file into a temporary Linux working directory;
+2. remove normal trailing CP/M `1Ah` padding when the file is clearly ASCII text;
+3. open the file in the configured Linux editor;
+4. wait for the editor to release the file;
+5. compare the edited contents with the downloaded copy;
+6. if it changed, stage the new file on CP/M and safely replace the original;
+7. restore the original R/O, SYS, and ARC attributes and refresh the CP/M directory.
+
+If the editor closes without changing the file, nothing is sent back to CP/M.
+
+The default editor command is:
+
+```text
+subl --wait
+```
+
+when Sublime Text is installed. Choose **Editor Settings…** from the same right-click menu to change the command. Host Link appends the temporary filename automatically; alternatively, put `{file}` anywhere in the command where the filename should be substituted.
+
+For GUI editors, configure an option that waits until the edited file is closed. `Ctrl+E` is a shortcut for editing the currently selected CP/M file.
 
 ## Build HOST v2.2
 
@@ -105,7 +130,9 @@ PUT and GET use 128-byte data packets with CRC-16/XMODEM framing. DIR returns ra
 
 ```text
 run.sh                    production launcher
-launch_fileops.py         current file-management UI layer
+launch_targetsim.py       production entry point + targetsim serial discovery
+launch_editor.py          CP/M external-editor workflow
+launch_fileops.py         CP/M rename/attributes/delete UI layer
 launch_listview.py        multi-selection/list-view layer
 launch_resizable.py       pane and common UI behavior
 launch_dualpane.py        bidirectional GET support layer
