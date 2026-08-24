@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Launch the production Host Link UI with z80pack targetsim PTY discovery."""
+"""Launch the production Host Link UI with CP/M editing and targetsim discovery."""
 from __future__ import annotations
 
-import launch_fileops as production
+import launch_editor as production
 from emulator_serial import emulator_tty_path
 
 ui = production.base.ui
